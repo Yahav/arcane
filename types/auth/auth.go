@@ -34,6 +34,11 @@ type SessionMeta struct {
 
 type AuthenticationStatus string
 
+type LogoutResponse struct {
+	Message        string `json:"message" doc:"Response message"`
+	ProviderLogout bool   `json:"providerLogout" doc:"Whether the client should also sign out of the OIDC provider"`
+}
+
 const (
 	AuthenticationStatusAuthenticated AuthenticationStatus = "authenticated"
 	AuthenticationStatusMFARequired   AuthenticationStatus = "mfa_required"

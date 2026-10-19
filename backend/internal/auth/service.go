@@ -862,6 +862,32 @@ func (s *AuthService) RevokeSession(ctx context.Context, sessionID string) error
 	return nil
 }
 
+func (s *AuthService) Logout(ctx context.Context, sessionID string) (bool, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return false, nil
+	}
+	if err := s.RevokeSession(ctx, sessionID); err != nil {
+		return false, err
+	}
+	userSession, err := s.sessionService.GetSessionByID(ctx, sessionID)
+	if err != nil {
+		return false, err
+	}
+	appSettings, err := s.settingsService.GetSettings(ctx)
+	if err != nil {
+		return false, err
+	}
+	return userSession.Source == session.UserSessionSourceOidc && appSettings.OidcProviderLogout.IsTrue(), nil
+}
+
+func (s *AuthService) RevokeUserSessionsCreatedBefore(ctx context.Context, userID string, before time.Time) error {
+	if err := s.sessionService.RevokeUserSessionsCreatedBefore(ctx, userID, before); err != nil {
+		return err
+	}
+	s.invalidateTokenCache(func(entry verifiedTokenEntry) bool { return entry.User.ID == userID })
+	return nil
+}
+
 // LogoutAllOtherSessions revokes every active session for userID except
 // currentSessionID, so the caller stays signed in on their current device.
 func (s *AuthService) LogoutAllOtherSessions(ctx context.Context, userID, currentSessionID string) error {

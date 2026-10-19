@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -80,6 +82,14 @@ type GetOidcConfigOutput struct {
 	Body authtypes.OidcConfigResponse
 }
 
+type HandleBackchannelLogoutInput struct {
+	RawBody []byte `contentType:"application/x-www-form-urlencoded"`
+}
+
+type HandleBackchannelLogoutOutput struct {
+	CacheControl string `header:"Cache-Control"`
+}
+
 type InitiateDeviceAuthInput struct{}
 
 type InitiateDeviceAuthOutput struct {
@@ -142,6 +152,11 @@ func (h *OidcHandler) GetOidcConfig(ctx context.Context, input *GetOidcConfigInp
 	}
 	origin := httpx.GetClientBaseURL(input.Origin, input.XForwardedHost, input.XForwardedProto, input.Host, appUrl)
 
+	endSessionURL, err := h.oidcService.GetEndSessionURL(ctx, origin)
+	if err != nil {
+		slog.WarnContext(ctx, "OIDC config: failed to resolve end session URL", "error", err)
+	}
+
 	return &GetOidcConfigOutput{
 		Body: authtypes.OidcConfigResponse{
 			ClientID:                    oidcConfig.ClientID,
@@ -152,8 +167,31 @@ func (h *OidcHandler) GetOidcConfig(ctx context.Context, input *GetOidcConfigInp
 			UserinfoEndpoint:            oidcConfig.UserinfoEndpoint,
 			DeviceAuthorizationEndpoint: oidcConfig.DeviceAuthorizationEndpoint,
 			Scopes:                      oidcConfig.Scopes,
+			EndSessionUrl:               endSessionURL,
 		},
 	}, nil
+}
+
+func (h *OidcHandler) HandleBackchannelLogout(ctx context.Context, input *HandleBackchannelLogoutInput) (*HandleBackchannelLogoutOutput, error) {
+	noStore := http.Header{"Cache-Control": []string{"no-store"}}
+	enabled, err := h.authService.IsOidcEnabled(ctx)
+	if err != nil {
+		return nil, huma.ErrorWithHeaders(huma.Error500InternalServerError("Failed to check OIDC status"), noStore)
+	}
+	if !enabled {
+		return nil, huma.ErrorWithHeaders(huma.Error400BadRequest("OIDC authentication is disabled"), noStore)
+	}
+
+	form, err := url.ParseQuery(string(input.RawBody))
+	if err != nil {
+		return nil, huma.ErrorWithHeaders(huma.Error400BadRequest("Invalid logout request body"), noStore)
+	}
+	if handleBackchannelLogoutErr := h.oidcService.HandleBackchannelLogout(ctx, form.Get("logout_token")); handleBackchannelLogoutErr != nil {
+		slog.WarnContext(ctx, "OIDC back-channel logout failed", "error", handleBackchannelLogoutErr)
+		return nil, huma.ErrorWithHeaders(huma.Error400BadRequest("Invalid logout token"), noStore)
+	}
+
+	return &HandleBackchannelLogoutOutput{CacheControl: "no-store"}, nil
 }
 
 // GetOidcAuthUrl generates an OIDC authorization URL and sets the state cookie.

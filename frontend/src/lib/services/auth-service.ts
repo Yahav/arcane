@@ -8,7 +8,7 @@ import { environmentStatusStore } from '#lib/stores/environment-status.store.sve
 import { featureStore } from '#lib/stores/features.store.svelte.js';
 import userStore from '#lib/stores/user-store.svelte.js';
 import { versionStore } from '#lib/stores/version.store.svelte.js';
-import type { User, MFAChallenge, AuthenticationResponse } from '#lib/types/auth.js';
+import type { User, MFAChallenge, AuthenticationResponse, LogoutResult } from '#lib/types/auth.js';
 import type { LoginCredentials, AutoLoginConfig } from '#lib/types/auth.js';
 import type { OidcStatusInfo } from '#lib/types/settings.js';
 import { parseInstant } from '#lib/utils/formatting.js';
@@ -32,7 +32,7 @@ class AuthService extends BaseAPIService {
 	private refreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private isRefreshing = false;
 	private refreshSubscribers: Array<(token: string | null, error?: Error) => void> = [];
-	private logoutRequest: Promise<boolean> | null = null;
+	private logoutRequest: Promise<LogoutResult> | null = null;
 
 	constructor() {
 		super();
@@ -220,6 +220,13 @@ class AuthService extends BaseAPIService {
 		return this.handleResponse<AuthenticationResponse>(this.api.post('/oidc/callback', { code, state }));
 	}
 
+	async getEndSessionUrl(): Promise<string> {
+		const result = await tryCatch(
+			this.handleResponse<{ endSessionUrl?: string }>(this.api.get('/oidc/config', { timeout: 5_000 }))
+		);
+		return result.data?.endSessionUrl ?? '';
+	}
+
 	async getStatus(): Promise<OidcStatusInfo> {
 		return this.handleResponse(this.api.get('/oidc/status'));
 	}
@@ -250,8 +257,8 @@ class AuthService extends BaseAPIService {
 		}
 	}
 
-	/** Ends the local session, then revokes the server session. Resolves false when revocation is unconfirmed. */
-	logout(queryClient: QueryClient): Promise<boolean> {
+	/** Ends the local session, then revokes the server session. Resolves revoked=false when revocation is unconfirmed. */
+	logout(queryClient: QueryClient): Promise<LogoutResult> {
 		// Reuse the pending request only while it still belongs to the current session.
 		if (this.logoutRequest && currentSessionSignal().aborted) return this.logoutRequest;
 
@@ -262,9 +269,11 @@ class AuthService extends BaseAPIService {
 		this.isRefreshing = false;
 		this.resetAuthenticatedState(queryClient);
 
-		const request: Promise<boolean> = tryCatch(this.api.post('/auth/logout', undefined, { timeout: 10_000 })).then((result) => {
+		const request: Promise<LogoutResult> = tryCatch(
+			this.handleResponse<{ providerLogout?: boolean }>(this.api.post('/auth/logout', undefined, { timeout: 10_000 }))
+		).then((result) => {
 			if (this.logoutRequest === request) this.logoutRequest = null;
-			return result.error === null;
+			return { revoked: result.error === null, providerLogout: result.data?.providerLogout === true };
 		});
 		this.logoutRequest = request;
 		return request;

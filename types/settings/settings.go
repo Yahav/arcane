@@ -459,6 +459,11 @@ type Update struct {
 	// Required: false
 	OidcAutoRedirectToProvider *string `json:"oidcAutoRedirectToProvider,omitzero"`
 
+	// OidcProviderLogout indicates if signing out of Arcane should also sign out of the OIDC provider.
+	//
+	// Required: false
+	OidcProviderLogout *string `json:"oidcProviderLogout,omitzero"`
+
 	// OidcProviderName is the custom display name for the OIDC provider.
 	//
 	// Required: false

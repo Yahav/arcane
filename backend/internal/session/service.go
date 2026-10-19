@@ -168,6 +168,16 @@ func (s *SessionService) DeleteExpiredSessions(ctx context.Context, revokedReten
 	return result.RowsAffected, nil
 }
 
+func (s *SessionService) RevokeUserSessionsCreatedBefore(ctx context.Context, userID string, before time.Time) error {
+	now := time.Now()
+	if err := s.db.WithContext(ctx).Model(&UserSession{}).
+		Where("user_id = ? AND revoked_at IS NULL AND created_at < ?", userID, before).
+		Updates(map[string]any{"revoked_at": now, "updated_at": now}).Error; err != nil {
+		return fmt.Errorf("failed to revoke user sessions: %w", err)
+	}
+	return nil
+}
+
 // RevokeAllUserSessionsExcept revokes every active session for userID, leaving
 // exceptSessionID active. Pass "" to revoke all sessions.
 func (s *SessionService) RevokeAllUserSessionsExcept(ctx context.Context, userID, exceptSessionID string) error {

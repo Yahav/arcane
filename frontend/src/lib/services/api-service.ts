@@ -273,7 +273,7 @@ class APIClient {
 		const isSessionFree =
 			!requestPath.startsWith('/auth/refresh') &&
 			(skipAuthPaths.some((prefix) => requestPath.startsWith(prefix)) ||
-				['/oidc/url', '/oidc/callback', '/oidc/status'].includes(requestPath) ||
+				['/oidc/url', '/oidc/callback', '/oidc/status', '/oidc/config'].includes(requestPath) ||
 				requestPath.startsWith('/app-version') ||
 				requestPath.endsWith('/settings/public'));
 		const session = isSessionFree ? undefined : sessionController.signal;

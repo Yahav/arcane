@@ -11,6 +11,7 @@ const LOCAL_SETTING_KEYS = new Set([
 	'authOidcConfig',
 	'oidcEnabled',
 	'oidcAutoRedirectToProvider',
+	'oidcProviderLogout',
 	'oidcMergeAccounts',
 	'oidcSkipTlsVerify',
 	'oidcClientId',

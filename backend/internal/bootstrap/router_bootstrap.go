@@ -224,6 +224,9 @@ func newRouter(p RouterParams) (*echo.Echo, *edge.TunnelServer) {
 		}, 5, 5,
 	))
 	apiGroup.Use(middleware.PerIPRateLimitForPaths(
+		[]string{"/api/oidc/logout"}, 120, 60,
+	))
+	apiGroup.Use(middleware.PerIPRateLimitForPaths(
 		[]string{"/api/auth/federated/token"}, 10, 10,
 	))
 	// Keyed per token for stored tokens, per source IP for everything else.

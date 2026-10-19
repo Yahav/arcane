@@ -180,6 +180,11 @@ type OidcConfigResponse struct {
 	//
 	// Required: true
 	Scopes string `json:"scopes"`
+
+	// EndSessionUrl is the provider URL that signs the user out of the OIDC provider.
+	//
+	// Required: false
+	EndSessionUrl string `json:"endSessionUrl,omitempty"`
 }
 
 // OidcCallbackRequest contains the OIDC callback parameters.

@@ -122,6 +122,7 @@ export type Settings = {
 	oidcGroupsClaim: string;
 	oidcSkipTlsVerify: boolean;
 	oidcAutoRedirectToProvider: boolean;
+	oidcProviderLogout: boolean;
 	oidcMergeAccounts: boolean;
 	oidcProviderName: string;
 	oidcProviderLogoUrl: string;

@@ -61,6 +61,7 @@ type Config struct {
 	OidcGroupsClaim            string `env:"OIDC_GROUPS_CLAIM" default:"groups"`
 	OidcSkipTlsVerify          bool   `env:"OIDC_SKIP_TLS_VERIFY" default:"false"`
 	OidcAutoRedirectToProvider bool   `env:"OIDC_AUTO_REDIRECT_TO_PROVIDER" default:"false"`
+	OidcProviderLogout         bool   `env:"OIDC_PROVIDER_LOGOUT" default:"false"`
 	OidcProviderName           string `env:"OIDC_PROVIDER_NAME" default:""`
 	OidcProviderLogoUrl        string `env:"OIDC_PROVIDER_LOGO_URL" default:""`
 	OidcMobileRedirectUris     string `env:"OIDC_MOBILE_REDIRECT_URIS" default:"arcane-mobile://oidc-callback"`

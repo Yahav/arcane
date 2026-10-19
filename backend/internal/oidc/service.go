@@ -27,8 +27,10 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/auth"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/user"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/jwtclaims"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/oidcjwk"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/tracing"
@@ -37,12 +39,15 @@ import (
 type OidcService struct {
 	authService        *auth.AuthService
 	settingsService    *settings.SettingsService
+	userService        *user.UserService
 	config             *config.Config
 	httpClient         *http.Client
 	insecureHttpClient *http.Client
 	providerCache      *hot.HotCache[oidcProviderKey, *oidc.Provider]
 	keySetManager      *oidcjwk.KeySetManager
 }
+
+const backchannelLogoutEvent = "http://schemas.openid.net/event/backchannel-logout"
 
 type oidcProviderKey struct {
 	issuer  string
@@ -57,7 +62,14 @@ type OidcState struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-func NewOidcService(authService *auth.AuthService, settingsService *settings.SettingsService, cfg *config.Config, httpClient *http.Client, keySetManager *oidcjwk.KeySetManager) *OidcService {
+func NewOidcService(
+	authService *auth.AuthService,
+	settingsService *settings.SettingsService,
+	userService *user.UserService,
+	cfg *config.Config,
+	httpClient *http.Client,
+	keySetManager *oidcjwk.KeySetManager,
+) *OidcService {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
@@ -96,6 +108,7 @@ func NewOidcService(authService *auth.AuthService, settingsService *settings.Set
 	return &OidcService{
 		authService:        authService,
 		settingsService:    settingsService,
+		userService:        userService,
 		config:             cfg,
 		httpClient:         &oidcClient,
 		insecureHttpClient: &insecureClient,
@@ -357,13 +370,7 @@ func (s *OidcService) HandleCallback(ctx context.Context, code, state, storedSta
 	return s.buildUserInfo(ctx, provider, cfg, token, idToken, rawIDToken)
 }
 
-func (s *OidcService) verifyIDToken(ctx context.Context, provider *oidc.Provider, cfg *settings.OidcConfig, token *oauth2.Token, nonce string) (*oidc.IDToken, string, error) {
-	rawIDToken, _ := token.Extra("id_token").(string)
-	if rawIDToken == "" {
-		slog.WarnContext(ctx, "HandleCallback: no ID token in response (non-compliant OIDC response)")
-		return nil, "", nil
-	}
-
+func (s *OidcService) newVerifier(ctx context.Context, provider *oidc.Provider, cfg *settings.OidcConfig) (*oidc.IDTokenVerifier, *http.Client, error) {
 	issuer, jwksURL := cfg.IssuerURL, cfg.JwksURI
 	if provider != nil {
 		var meta struct {
@@ -371,26 +378,39 @@ func (s *OidcService) verifyIDToken(ctx context.Context, provider *oidc.Provider
 			JWKSURL string `json:"jwks_uri"`
 		}
 		if err := provider.Claims(&meta); err != nil {
-			return nil, "", fmt.Errorf("failed to read provider metadata: %w", err)
+			return nil, nil, fmt.Errorf("failed to read provider metadata: %w", err)
 		}
 		issuer, jwksURL = meta.Issuer, meta.JWKSURL
 	}
 	if jwksURL == "" {
-		return nil, "", errors.New("jwks URI must be configured when using manual OIDC endpoints")
+		return nil, nil, errors.New("jwks URI must be configured when using manual OIDC endpoints")
 	}
 	if s.keySetManager == nil {
-		return nil, "", errors.New("failed to configure provider JWK set: JWK set manager is not configured")
+		return nil, nil, errors.New("failed to configure provider JWK set: JWK set manager is not configured")
 	}
 
 	client := s.httpClientFor(cfg.SkipTlsVerify)
 	keySet, err := s.keySetManager.KeySet(context.WithoutCancel(ctx), client, jwksURL)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to configure provider JWK set: %w", err)
+		return nil, nil, fmt.Errorf("failed to configure provider JWK set: %w", err)
 	}
-	verifier := oidc.NewVerifier(issuer, keySet, &oidc.Config{
+	return oidc.NewVerifier(issuer, keySet, &oidc.Config{
 		ClientID:             cfg.ClientID,
 		SupportedSigningAlgs: oidcjwk.SupportedSigningAlgs(),
-	})
+	}), client, nil
+}
+
+func (s *OidcService) verifyIDToken(ctx context.Context, provider *oidc.Provider, cfg *settings.OidcConfig, token *oauth2.Token, nonce string) (*oidc.IDToken, string, error) {
+	rawIDToken, _ := token.Extra("id_token").(string)
+	if rawIDToken == "" {
+		slog.WarnContext(ctx, "HandleCallback: no ID token in response (non-compliant OIDC response)")
+		return nil, "", nil
+	}
+
+	verifier, client, err := s.newVerifier(ctx, provider, cfg)
+	if err != nil {
+		return nil, "", err
+	}
 	idToken, err := verifier.Verify(oidc.ClientContext(ctx, client), rawIDToken)
 	if err != nil {
 		slog.ErrorContext(ctx, "HandleCallback: ID token verification failed", "error", err)
@@ -517,6 +537,108 @@ func (s *OidcService) buildUserInfo(
 	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("arcane.oidc.groups", len(userInfoDto.Groups)), attribute.Int("arcane.oidc.roles", len(userInfoDto.Roles)))
 	slog.InfoContext(ctx, "HandleCallback: authentication successful", "subject", userInfoDto.Subject, "email", userInfoDto.Email)
 	return &userInfoDto, tokenResp, nil
+}
+
+func (s *OidcService) HandleBackchannelLogout(ctx context.Context, rawToken string) (err error) {
+	ctx, span := otel.Tracer(tracing.InstrumentationName).Start(ctx, "oidc.backchannel_logout")
+	defer func() { tracing.End(span, err) }()
+
+	if rawToken == "" {
+		return errors.New("missing logout token")
+	}
+
+	cfg, err := s.effectiveConfig(ctx)
+	if err != nil {
+		return err
+	}
+	span.SetAttributes(configAttributes(cfg)...)
+
+	var provider *oidc.Provider
+	if !hasManualEndpoints(cfg) {
+		if provider, err = s.getOrDiscoverProvider(ctx, cfg); err != nil {
+			return err
+		}
+	}
+
+	verifier, client, err := s.newVerifier(ctx, provider, cfg)
+	if err != nil {
+		return err
+	}
+	logoutToken, err := verifier.Verify(oidc.ClientContext(ctx, client), rawToken)
+	if err != nil {
+		slog.WarnContext(ctx, "HandleBackchannelLogout: logout token verification failed", "error", err)
+		return fmt.Errorf("failed to verify logout token: %w", err)
+	}
+
+	var claims map[string]any
+	if claimsErr := logoutToken.Claims(&claims); claimsErr != nil {
+		return fmt.Errorf("failed to decode logout token claims: %w", claimsErr)
+	}
+	events, _ := claims["events"].(map[string]any)
+	if _, ok := events[backchannelLogoutEvent]; !ok {
+		return errors.New("logout token is missing the back-channel logout event")
+	}
+	if logoutToken.Subject == "" {
+		return errors.New("logout token is missing the 'sub' claim")
+	}
+	if logoutToken.IssuedAt.IsZero() {
+		return errors.New("logout token is missing the 'iat' claim")
+	}
+	if _, ok := claims["nonce"]; ok {
+		return errors.New("logout token must not contain a nonce")
+	}
+
+	logoutUser, err := s.userService.GetUserByOidcSubjectId(ctx, logoutToken.Subject)
+	if errors.Is(err, common.ErrUserNotFound) {
+		slog.InfoContext(ctx, "HandleBackchannelLogout: no user matches logout token subject", "subject", logoutToken.Subject)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to look up user for logout token: %w", err)
+	}
+
+	if logoutErr := s.authService.RevokeUserSessionsCreatedBefore(ctx, logoutUser.ID, logoutToken.IssuedAt.Add(time.Second)); logoutErr != nil {
+		return fmt.Errorf("failed to revoke user sessions: %w", logoutErr)
+	}
+	slog.InfoContext(ctx, "HandleBackchannelLogout: revoked user sessions", "userId", logoutUser.ID, "subject", logoutToken.Subject)
+	return nil
+}
+
+func (s *OidcService) GetEndSessionURL(ctx context.Context, origin string) (string, error) {
+	cfg, err := s.effectiveConfig(ctx)
+	if errors.Is(err, auth.ErrOidcAuthDisabled) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if hasManualEndpoints(cfg) {
+		return "", nil
+	}
+
+	provider, err := s.getOrDiscoverProvider(ctx, cfg)
+	if err != nil {
+		return "", err
+	}
+	var meta struct {
+		EndSessionEndpoint string `json:"end_session_endpoint"`
+	}
+	if claimsErr := provider.Claims(&meta); claimsErr != nil {
+		return "", fmt.Errorf("failed to read provider metadata: %w", claimsErr)
+	}
+	if meta.EndSessionEndpoint == "" {
+		return "", nil
+	}
+
+	endSessionURL, err := url.Parse(meta.EndSessionEndpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid end session endpoint: %w", err)
+	}
+	query := endSessionURL.Query()
+	query.Set("client_id", cfg.ClientID)
+	query.Set("post_logout_redirect_uri", origin+"/login")
+	endSessionURL.RawQuery = query.Encode()
+	return endSessionURL.String(), nil
 }
 
 // postForm sends an OAuth form POST and decodes the JSON response body, along with the HTTP status code.

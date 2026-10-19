@@ -68,6 +68,16 @@ func RegisterOidc(
 	}, h.HandleOidcCallback)
 
 	huma.Register(api, huma.Operation{
+		OperationID: "oidc-backchannel-logout",
+		Method:      http.MethodPost,
+		Path:        "/oidc/logout",
+		Summary:     "Handle OIDC back-channel logout",
+		Description: "Receive an OIDC back-channel logout token from the provider and revoke the user's sessions",
+		Tags:        []string{"OIDC"},
+		Security:    []map[string][]string{},
+	}, h.HandleBackchannelLogout)
+
+	huma.Register(api, huma.Operation{
 		OperationID: "initiate-oidc-device-auth",
 		Method:      http.MethodPost,
 		Path:        "/oidc/device/code",

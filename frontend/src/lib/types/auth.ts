@@ -372,3 +372,8 @@ export type CreateFederatedCredential = {
 };
 
 export type UpdateFederatedCredential = Partial<CreateFederatedCredential>;
+
+export type LogoutResult = {
+	revoked: boolean;
+	providerLogout: boolean;
+};

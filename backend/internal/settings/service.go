@@ -340,6 +340,7 @@ func DefaultSettingsConfig() *Settings {
 		OidcGroupsClaim:                       SettingVariable{Value: "groups"},
 		OidcSkipTlsVerify:                     SettingVariable{Value: "false"},
 		OidcAutoRedirectToProvider:            SettingVariable{Value: "false"},
+		OidcProviderLogout:                    SettingVariable{Value: "false"},
 		OidcMergeAccounts:                     SettingVariable{Value: "false"},
 		OidcProviderName:                      SettingVariable{Value: ""},
 		OidcProviderLogoUrl:                   SettingVariable{Value: ""},

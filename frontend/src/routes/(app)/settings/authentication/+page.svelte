@@ -126,6 +126,7 @@
 			oidcMergeAccounts: z.boolean(),
 			oidcSkipTlsVerify: z.boolean(),
 			oidcAutoRedirectToProvider: z.boolean(),
+			oidcProviderLogout: z.boolean(),
 			oidcClientId: z.string(),
 			oidcClientSecret: z.string(),
 			oidcClearClientSecret: z.boolean(),
@@ -168,6 +169,7 @@
 			oidcMergeAccounts: source.oidcMergeAccounts,
 			oidcSkipTlsVerify: source.oidcSkipTlsVerify,
 			oidcAutoRedirectToProvider: source.oidcAutoRedirectToProvider,
+			oidcProviderLogout: source.oidcProviderLogout,
 			oidcClientId: source.oidcClientId,
 			oidcClientSecret: '',
 			oidcClearClientSecret: false,
@@ -200,6 +202,8 @@
 	);
 
 	const redirectUri = $derived(`${globalThis?.location?.origin ?? ''}/auth/oidc/callback`);
+	const backchannelLogoutUrl = $derived(`${globalThis?.location?.origin ?? ''}/api/oidc/logout`);
+	const postLogoutRedirectUri = $derived(`${globalThis?.location?.origin ?? ''}/login`);
 	const isOidcEnvForced = $derived(data.oidcStatus.envForced);
 	const isOidcForcedEnabled = $derived(isOidcEnvForced && currentSettings.oidcEnabled);
 	const isOidcForcedDisabled = $derived(isOidcEnvForced && !currentSettings.oidcEnabled);
@@ -488,10 +492,54 @@
 										bind:checked={formInputs.oidcAutoRedirectToProvider.value}
 									/>
 								</SettingsRow>
+								<SettingsRow
+									for="oidcProviderLogoutSwitch"
+									label={m.oidc_provider_logout_label()}
+									description={m.oidc_provider_logout_description()}
+									layout="switch"
+								>
+									<Switch
+										id="oidcProviderLogoutSwitch"
+										disabled={isOidcEnvForced}
+										bind:checked={formInputs.oidcProviderLogout.value}
+									/>
+								</SettingsRow>
 								<SettingsRow label={m.oidc_redirect_uri_title()} description={m.oidc_redirect_uri_description()} layout="wide">
 									<div class="flex items-center gap-2">
 										<code class="flex-1 rounded-md bg-muted/60 p-2 font-mono text-xs break-all">{redirectUri}</code>
 										<CopyButton text={redirectUri} size="sm" variant="outline" class="shrink-0" title={m.common_copy()} />
+									</div>
+								</SettingsRow>
+								<SettingsRow
+									label={m.oidc_backchannel_logout_url_title()}
+									description={m.oidc_backchannel_logout_url_description()}
+									layout="wide"
+								>
+									<div class="flex items-center gap-2">
+										<code class="flex-1 rounded-md bg-muted/60 p-2 font-mono text-xs break-all">{backchannelLogoutUrl}</code>
+										<CopyButton
+											text={backchannelLogoutUrl}
+											size="sm"
+											variant="outline"
+											class="shrink-0"
+											title={m.common_copy()}
+										/>
+									</div>
+								</SettingsRow>
+								<SettingsRow
+									label={m.oidc_post_logout_redirect_uri_title()}
+									description={m.oidc_post_logout_redirect_uri_description()}
+									layout="wide"
+								>
+									<div class="flex items-center gap-2">
+										<code class="flex-1 rounded-md bg-muted/60 p-2 font-mono text-xs break-all">{postLogoutRedirectUri}</code>
+										<CopyButton
+											text={postLogoutRedirectUri}
+											size="sm"
+											variant="outline"
+											class="shrink-0"
+											title={m.common_copy()}
+										/>
 									</div>
 								</SettingsRow>
 							{/if}

@@ -61,7 +61,7 @@ type LoginOutput struct {
 
 type LogoutOutput struct {
 	SetCookie []string `header:"Set-Cookie" doc:"Cleared session cookie"`
-	Body      base.ApiResponse[base.MessageResponse]
+	Body      base.ApiResponse[auth.LogoutResponse]
 }
 
 type RefreshTokenInput struct {
@@ -167,23 +167,22 @@ func (h *AuthHandler) Login(ctx context.Context, input *LoginInput) (*LoginOutpu
 
 // Logout clears the authentication session.
 func (h *AuthHandler) Logout(ctx context.Context, input *struct{}) (*LogoutOutput, error) {
-	if h.authService != nil {
-		if sessionID, exists := middleware.GetCurrentSessionIDFromContext(ctx); exists {
-			if err := h.authService.RevokeSession(ctx, sessionID); err != nil {
-				slog.ErrorContext(ctx, "Failed to revoke session on logout; clearing cookie anyway", "sessionId", sessionID, "error", err)
-			}
-		}
-		if userModel, exists := userdomain.CurrentUserFromContext(ctx); exists {
-			h.authService.LogLogout(ctx, userModel)
-		}
+	sessionID, _ := middleware.GetCurrentSessionIDFromContext(ctx)
+	providerLogout, err := h.authService.Logout(ctx, sessionID)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to revoke session on logout; clearing cookie anyway", "sessionId", sessionID, "error", err)
+	}
+	if userModel, exists := userdomain.CurrentUserFromContext(ctx); exists {
+		h.authService.LogLogout(ctx, userModel)
 	}
 
 	return &LogoutOutput{
 		SetCookie: cookie.BuildClearTokenCookieStringsFor(cookie.SecureCookieFromContext(ctx)),
-		Body: base.ApiResponse[base.MessageResponse]{
+		Body: base.ApiResponse[auth.LogoutResponse]{
 			Success: true,
-			Data: base.MessageResponse{
-				Message: "Logged out successfully",
+			Data: auth.LogoutResponse{
+				Message:        "Logged out successfully",
+				ProviderLogout: providerLogout,
 			},
 		},
 	}, nil
