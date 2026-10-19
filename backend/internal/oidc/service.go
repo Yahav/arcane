@@ -113,7 +113,7 @@ func NewOidcService(
 		httpClient:         &oidcClient,
 		insecureHttpClient: &insecureClient,
 		keySetManager:      keySetManager,
-		providerCache:      hot.NewHotCache[oidcProviderKey, *oidc.Provider](hot.LRU, 4).Build(),
+		providerCache:      hot.NewHotCache[oidcProviderKey, *oidc.Provider](hot.LRU, 4).WithTTL(time.Hour).Build(),
 	}
 }
 

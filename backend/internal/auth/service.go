@@ -31,6 +31,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/user"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/cookie"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/jwtclaims"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/validation"
 )
@@ -43,10 +44,19 @@ var (
 )
 
 type TokenPair struct {
-	AccessToken  string    `json:"accessToken"`
-	BrowserToken string    `json:"-"`
-	RefreshToken string    `json:"refreshToken"`
-	ExpiresAt    time.Time `json:"expiresAt"`
+	AccessToken      string    `json:"accessToken"`
+	BrowserToken     string    `json:"-"`
+	RefreshToken     string    `json:"refreshToken"`
+	BrowserRefresh   string    `json:"-"`
+	ExpiresAt        time.Time `json:"expiresAt"`
+	RefreshExpiresAt time.Time `json:"-"`
+}
+
+func (p *TokenPair) CookieHeaders(secure bool) []string {
+	return append(
+		cookie.BuildTokenCookieStringFor(max(int(time.Until(p.ExpiresAt).Seconds()), 0)+60, p.BrowserToken, secure),
+		cookie.BuildRefreshCookieStringFor(int(time.Until(p.RefreshExpiresAt).Seconds()), p.BrowserRefresh, secure),
+	)
 }
 
 type verifiedTokenEntry struct {
@@ -67,13 +77,25 @@ type AuthService struct {
 	browserSigningKey []byte
 	refreshExpiry     time.Duration
 	config            *config.Config
-	// tokenCache is a per-process in-memory cache for verified tokens. A hit
-	// skips signature verification and the user/session lookups; revocation in
-	// this process purges entries, revocation by another process is visible
-	// once the TTL lapses.
-	tokenCache  *hot.HotCache[string, verifiedTokenEntry]
-	cacheGen    atomic.Uint64
-	cacheFillMu sync.Mutex
+	tokenCache        *hot.HotCache[string, verifiedTokenEntry]
+	cacheGen          atomic.Uint64
+	cacheFillMu       sync.Mutex
+	dummyMu           sync.Mutex
+	dummyHash         string
+}
+
+func (s *AuthService) dummyPasswordHash(ctx context.Context) (string, error) {
+	s.dummyMu.Lock()
+	defer s.dummyMu.Unlock()
+	if s.dummyHash != "" {
+		return s.dummyHash, nil
+	}
+	hash, err := s.userService.HashPassword(ctx, uuid.New().String())
+	if err != nil {
+		return "", fmt.Errorf("failed to prepare dummy password hash: %w", err)
+	}
+	s.dummyHash = hash
+	return hash, nil
 }
 
 func NewAuthService(
@@ -233,9 +255,22 @@ func (s *AuthService) AuthenticateLocalPrimary(ctx context.Context, username, pa
 		}
 	}
 	if localUser == nil {
+		dummyHash, dummyErr := s.dummyPasswordHash(ctx)
+		if dummyErr != nil {
+			return nil, dummyErr
+		}
+		_ = s.userService.ValidatePassword(ctx, dummyHash, password)
 		return nil, ErrInvalidCredentials
 	}
-	if validatePasswordErr := s.userService.ValidatePassword(localUser.PasswordHash, password); validatePasswordErr != nil {
+	passwordHash := localUser.PasswordHash
+	if passwordHash == "" {
+		dummyHash, dummyErr := s.dummyPasswordHash(ctx)
+		if dummyErr != nil {
+			return nil, dummyErr
+		}
+		passwordHash = dummyHash
+	}
+	if validatePasswordErr := s.userService.ValidatePassword(ctx, passwordHash, password); validatePasswordErr != nil {
 		return nil, ErrInvalidCredentials
 	}
 
@@ -384,7 +419,7 @@ func (s *AuthService) findOrCreateOidcUser(ctx context.Context, userInfo auth.Oi
 			case existingUser == nil:
 			case !userInfo.EmailVerified:
 				// Only a provider-verified email may claim an existing account.
-				return nil, false, errors.New("email not verified by OIDC provider; cannot merge accounts")
+				return nil, false, common.Classify(common.ErrForbidden, errors.New("email not verified by OIDC provider; cannot merge accounts"))
 			default:
 				slog.InfoContext(ctx, "Merging OIDC account with existing user", "email", userInfo.Email, "subject", userInfo.Subject)
 				// Perform the merge atomically to avoid races when multiple OIDC subjects share the same email
@@ -398,10 +433,8 @@ func (s *AuthService) findOrCreateOidcUser(ctx context.Context, userInfo auth.Oi
 				if mergeErr != nil {
 					return nil, false, mergeErr
 				}
-				if merged != nil {
-					if syncErr := s.syncOidcRoleAssignments(ctx, merged, userInfo, tokenResp); syncErr != nil {
-						slog.WarnContext(ctx, "failed to sync OIDC role assignments on user merge", "error", syncErr, "userId", merged.ID)
-					}
+				if syncErr := s.syncOidcRoleAssignments(ctx, merged, userInfo, tokenResp); syncErr != nil {
+					return nil, false, fmt.Errorf("failed to sync OIDC role assignments on user merge: %w", syncErr)
 				}
 				return merged, false, nil
 			}
@@ -467,7 +500,7 @@ func (s *AuthService) createOidcUser(ctx context.Context, userInfo auth.OidcUser
 		return nil, createErr
 	}
 	if syncOidcRoleAssignmentsErr := s.syncOidcRoleAssignments(ctx, localUser, userInfo, tokenResp); syncOidcRoleAssignmentsErr != nil {
-		slog.WarnContext(ctx, "failed to sync OIDC role assignments on user create", "error", syncOidcRoleAssignmentsErr, "userId", localUser.ID)
+		return nil, fmt.Errorf("failed to sync OIDC role assignments on user create: %w", syncOidcRoleAssignmentsErr)
 	}
 	return localUser, nil
 }
@@ -523,7 +556,7 @@ func (s *AuthService) updateOidcUser(ctx context.Context, localUser *user.User, 
 		return nil, err
 	}
 	if syncErr := s.syncOidcRoleAssignments(ctx, updated, userInfo, tokenResp); syncErr != nil {
-		slog.WarnContext(ctx, "failed to sync OIDC role assignments on user update", "error", syncErr, "userId", updated.ID)
+		return nil, fmt.Errorf("failed to sync OIDC role assignments on user update: %w", syncErr)
 	}
 	return updated, nil
 }
@@ -567,7 +600,12 @@ func (s *AuthService) syncOidcRoleAssignments(ctx context.Context, localUser *us
 		})
 	}
 
-	return s.roleService.ReplaceUserAssignments(ctx, localUser.ID, role.RoleAssignmentSourceOidc, desired)
+	err = s.roleService.ReplaceUserAssignments(ctx, localUser.ID, role.RoleAssignmentSourceOidc, desired)
+	if errors.Is(err, common.ErrNoGlobalAdminRemains) {
+		slog.WarnContext(ctx, "OIDC role sync would remove the last global admin; keeping existing assignments", "userId", localUser.ID)
+		return nil
+	}
+	return err
 }
 
 // extractOidcGroups reads the user's group memberships from the OIDC userinfo
@@ -655,12 +693,23 @@ func (s *AuthService) loadBrowserSigningKey(ctx context.Context) ([]byte, error)
 	return key, nil
 }
 
-func (s *AuthService) RefreshToken(ctx context.Context, refreshToken string, meta auth.SessionMeta) (*TokenPair, error) {
+func (s *AuthService) parseAnyRefreshToken(ctx context.Context, refreshToken string) (*refreshTokenClaims, error) {
+	if algorithm, _ := signedTokenAlgorithm(refreshToken); algorithm == jwa.HS512().String() {
+		browserKey, err := s.loadBrowserSigningKey(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return parseRefreshToken(ctx, refreshToken, browserRefreshSubject, jwt.WithKey(jwa.HS512(), browserKey))
+	}
 	signingKey, err := s.loadSigningKey(ctx)
 	if err != nil {
 		return nil, err
 	}
-	claims, err := parseRefreshToken(ctx, refreshToken, signingKey.PublicKey())
+	return parseRefreshToken(ctx, refreshToken, refreshTokenSubject, jwt.WithKey(jwa.MLDSA87(), signingKey.PublicKey()))
+}
+
+func (s *AuthService) RefreshToken(ctx context.Context, refreshToken string, meta auth.SessionMeta) (*TokenPair, error) {
+	claims, err := s.parseAnyRefreshToken(ctx, refreshToken)
 	if err != nil {
 		return nil, err
 	}
@@ -684,12 +733,12 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken string, met
 		return nil, validateActiveErr
 	}
 
-	rotatedSession, refreshJTI, err := s.sessionService.RotateRefreshToken(ctx, claims.SessionID, claims.ID, meta)
+	localUser, err := s.userService.GetUserByID(ctx, claims.UserID)
 	if err != nil {
 		return nil, err
 	}
 
-	localUser, err := s.userService.GetUserByID(ctx, claims.UserID)
+	rotatedSession, refreshJTI, err := s.sessionService.RotateRefreshToken(ctx, claims.SessionID, claims.ID, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -801,8 +850,11 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 		return err
 	}
 
+	if localUser.PasswordHash == "" && kit.FromPtr(localUser.OidcSubjectId) != "" {
+		return common.Classify(common.ErrForbidden, errors.New("local passwords cannot be set for accounts managed by an identity provider"))
+	}
 	if localUser.PasswordHash != "" {
-		if validatePasswordErr := s.userService.ValidatePassword(localUser.PasswordHash, currentPassword); validatePasswordErr != nil {
+		if validatePasswordErr := s.userService.ValidatePassword(ctx, localUser.PasswordHash, currentPassword); validatePasswordErr != nil {
 			return ErrInvalidCredentials
 		}
 	}
@@ -812,7 +864,7 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 		return common.Classify(common.ErrValidation, validatePasswordPolicyErr)
 	}
 
-	if _, err = s.userService.SetPasswordAndRevokeSessionsExcept(ctx, localUser, newPassword, currentSessionID); err != nil {
+	if _, err = s.userService.SetPasswordAndRevokeSessionsExcept(ctx, localUser, newPassword, currentSessionID, nil); err != nil {
 		return err
 	}
 	// The current session's cached user still carries the old password flags.
@@ -886,6 +938,18 @@ func (s *AuthService) RevokeUserSessionsCreatedBefore(ctx context.Context, userI
 	}
 	s.invalidateTokenCache(func(entry verifiedTokenEntry) bool { return entry.User.ID == userID })
 	return nil
+}
+
+func (s *AuthService) Stop() {
+	s.tokenCache.StopJanitor()
+}
+
+func (s *AuthService) RevokeSessionByRefreshToken(ctx context.Context, refreshToken string) error {
+	claims, err := s.parseAnyRefreshToken(ctx, refreshToken)
+	if err != nil {
+		return err
+	}
+	return s.RevokeSession(ctx, claims.SessionID)
 }
 
 // LogoutAllOtherSessions revokes every active session for userID except
@@ -983,11 +1047,32 @@ func (s *AuthService) buildTokenPair(ctx context.Context, localUser *user.User, 
 		return nil, err
 	}
 
+	browserRefreshBuilder := jwt.NewBuilder().
+		JwtID(refreshJTI).
+		Subject(browserRefreshSubject).
+		IssuedAt(now).
+		Expiration(localSession.ExpiresAt).
+		Claim(claimUserID, localUser.ID).
+		Claim(claimSessionID, localSession.ID)
+	if config.Version != "" {
+		browserRefreshBuilder.Claim(claimAppVersion, config.Version)
+	}
+	browserRefresh, err := browserRefreshBuilder.Build()
+	if err != nil {
+		return nil, err
+	}
+	browserRefreshBytes, err := jwt.Sign(browserRefresh, jwt.WithKey(jwa.HS512(), browserSigningKey))
+	if err != nil {
+		return nil, err
+	}
+
 	return &TokenPair{
-		AccessToken:  string(accessTokenBytes),
-		BrowserToken: string(browserTokenBytes),
-		RefreshToken: string(refreshTokenBytes),
-		ExpiresAt:    accessTokenExpiry,
+		AccessToken:      string(accessTokenBytes),
+		BrowserToken:     string(browserTokenBytes),
+		RefreshToken:     string(refreshTokenBytes),
+		BrowserRefresh:   string(browserRefreshBytes),
+		ExpiresAt:        accessTokenExpiry,
+		RefreshExpiresAt: localSession.ExpiresAt,
 	}, nil
 }
 

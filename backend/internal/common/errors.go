@@ -1,6 +1,12 @@
 package common
 
-import "errors"
+import (
+	"context"
+	"errors"
+
+	"github.com/containerd/errdefs"
+	"github.com/moby/moby/client"
+)
 
 const (
 	// ConfigurationErrorCodeEnvFileUnreadable is the ConfigurationError code reported
@@ -22,6 +28,23 @@ func Classify(kind, err error) error {
 		return err
 	}
 	return &classified{kind: kind, err: err}
+}
+
+func ClassifyDockerError(err error) error {
+	switch {
+	case errdefs.IsNotFound(err):
+		return Classify(ErrNotFound, err)
+	case errdefs.IsConflict(err):
+		return Classify(ErrConflict, err)
+	case errdefs.IsInvalidArgument(err):
+		return Classify(ErrBadRequest, err)
+	case errdefs.IsUnavailable(err), client.IsErrConnectionFailed(err):
+		return Classify(ErrUnavailable, err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return Classify(ErrTimeout, err)
+	default:
+		return err
+	}
 }
 
 func (e *classified) Error() string { return e.err.Error() }
@@ -81,6 +104,7 @@ var (
 	ErrRoleNotFound                            = Classify(ErrNotFound, errors.New("Role not found"))
 	ErrRoleBuiltIn                             = Classify(ErrForbidden, errors.New("Built-in role cannot be modified"))
 	ErrRoleNameTaken                           = Classify(ErrConflict, errors.New("Role name already in use"))
+	ErrRoleUsedByFederatedCredential           = Classify(ErrConflict, errors.New("Role is used by a federated credential"))
 	ErrUnknownPermission                       = Classify(ErrValidation, errors.New("Unknown permission"))
 	ErrRolePermissionEscalation                = Classify(ErrForbidden, errors.New("cannot grant a permission you do not hold"))
 	ErrInvalidRoleAssignment                   = Classify(ErrBadRequest, errors.New("invalid role assignment"))

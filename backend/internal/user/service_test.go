@@ -102,7 +102,7 @@ func TestSetPasswordUpdatesHashAndClearsPasswordChangeRequirement(t *testing.T) 
 	userSvc, _ := setupUserAndRoleServices(t)
 	ctx := t.Context()
 
-	oldHash, err := userSvc.HashPassword("old-password")
+	oldHash, err := userSvc.HashPassword(t.Context(), "old-password")
 	require.NoError(t, err)
 	localUser, err := userSvc.CreateUser(ctx, &userdomain.User{
 		ID:                     "password-user",
@@ -117,8 +117,8 @@ func TestSetPasswordUpdatesHashAndClearsPasswordChangeRequirement(t *testing.T) 
 
 	updated, err := userSvc.GetUserByID(ctx, localUser.ID)
 	require.NoError(t, err)
-	require.NoError(t, userSvc.ValidatePassword(updated.PasswordHash, "new-password"))
-	require.Error(t, userSvc.ValidatePassword(updated.PasswordHash, "old-password"))
+	require.NoError(t, userSvc.ValidatePassword(t.Context(), updated.PasswordHash, "new-password"))
+	require.Error(t, userSvc.ValidatePassword(t.Context(), updated.PasswordHash, "old-password"))
 	require.False(t, updated.RequiresPasswordChange)
 }
 
@@ -264,9 +264,7 @@ func TestUserDtoExposesLastLogin(t *testing.T) {
 	require.Nil(t, dto.LastLogin, "a user who has never signed in has no last login")
 
 	loginAt := time.Date(2026, 8, 2, 15, 4, 5, 0, time.UTC)
-	u.LastLogin = &loginAt
-	_, err = userSvc.UpdateUser(ctx, u, nil)
-	require.NoError(t, err)
+	require.NoError(t, userSvc.TouchLastLogin(ctx, u.ID, loginAt))
 
 	reloaded, err := userSvc.GetUserByID(ctx, u.ID)
 	require.NoError(t, err)

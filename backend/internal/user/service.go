@@ -51,6 +51,7 @@ type UserService struct {
 	db                   *database.DB
 	roleService          *role.RoleService
 	argon2Params         *Argon2Params
+	argon2Slots          chan struct{}
 	revokeSessionsExcept func(context.Context, *gorm.DB, string, string) error
 }
 
@@ -58,6 +59,7 @@ var (
 	ErrCannotRemoveLastAdmin = errors.New("cannot remove the last admin user")
 	ErrUsernameRequired      = errors.New("username is required")
 	ErrUsernameTaken         = errors.New("username already in use")
+	ErrEmailTaken            = common.Classify(common.ErrConflict, errors.New("email already in use"))
 
 	// ErrInsufficientPrivilege is returned when a caller attempts to modify a
 	// target whose effective privilege is equal to or higher than the caller's
@@ -70,18 +72,25 @@ func NewUserService(db *database.DB, roleService *role.RoleService, revokeSessio
 		db:                   db,
 		roleService:          roleService,
 		argon2Params:         DefaultArgon2Params(),
+		argon2Slots:          make(chan struct{}, 4),
 		revokeSessionsExcept: revokeSessionsExcept,
 	}
 }
 
-func (s *UserService) HashPassword(password string) (string, error) {
+func (s *UserService) HashPassword(ctx context.Context, password string) (string, error) {
 	salt := make([]byte, s.argon2Params.saltLength)
 	_, err := rand.Read(salt)
 	if err != nil {
 		return "", err
 	}
 
+	select {
+	case s.argon2Slots <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 	hash := argon2.IDKey([]byte(password), salt, s.argon2Params.iterations, s.argon2Params.memory, s.argon2Params.parallelism, s.argon2Params.keyLength)
+	<-s.argon2Slots
 
 	b64Salt := base64.RawStdEncoding.EncodeToString(salt)
 	b64Hash := base64.RawStdEncoding.EncodeToString(hash)
@@ -91,7 +100,7 @@ func (s *UserService) HashPassword(password string) (string, error) {
 	return encodedHash, nil
 }
 
-func (s *UserService) ValidatePassword(encodedHash, password string) error {
+func (s *UserService) ValidatePassword(ctx context.Context, encodedHash, password string) error {
 	parts := strings.Split(encodedHash, "$")
 	if len(parts) != 6 {
 		return errors.New("invalid hash format")
@@ -128,7 +137,13 @@ func (s *UserService) ValidatePassword(encodedHash, password string) error {
 		return errors.New("invalid hash length")
 	}
 
+	select {
+	case s.argon2Slots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	comparisonHash := argon2.IDKey([]byte(password), salt, iterations, memory, parallelism, uint32(hashLen))
+	<-s.argon2Slots
 
 	// constant-time compare
 	if subtle.ConstantTimeCompare(comparisonHash, decodedHash) != 1 {
@@ -149,6 +164,11 @@ func (s *UserService) CreateUser(ctx context.Context, localUser *User) (*User, e
 	localUser.Username = username
 
 	err = dbutil.WithTx(ctx, s.db.DB, func(tx *gorm.DB) error {
+		if localUser.OidcSubjectId == nil {
+			if ensureEmailErr := ensureEmailAvailable(tx, localUser.ID, localUser.Email); ensureEmailErr != nil {
+				return ensureEmailErr
+			}
+		}
 		if createUserErr := tx.Create(localUser).Error; createUserErr != nil {
 			if isDuplicateKeyErrorInternal(tx, createUserErr) {
 				return ErrUsernameTaken
@@ -276,22 +296,64 @@ func (s *UserService) UpdateUser(ctx context.Context, localUser *User, actorPerm
 	if err := normalization.Normalize(localUser); err != nil {
 		return nil, err
 	}
+	var updated User
 	err := dbutil.WithTx(ctx, s.db.DB, func(tx *gorm.DB) error {
 		if err := s.checkTargetPrivilegeInternal(ctx, tx, actorPerms, localUser.ID); err != nil {
 			return err
 		}
-		if err := tx.Save(localUser).Error; err != nil {
+		var current User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", localUser.ID).First(&current).Error; err != nil {
+			return fmt.Errorf("failed to load user: %w", err)
+		}
+		if !strings.EqualFold(kit.FromPtr(current.Email), kit.FromPtr(localUser.Email)) {
+			if err := ensureEmailAvailable(tx, localUser.ID, localUser.Email); err != nil {
+				return err
+			}
+		}
+		if err := tx.Model(&User{}).
+			Where("id = ?", localUser.ID).
+			Select("username", "display_name", "email", "locale", "time_format", "font_size", "preferences", "updated_at").
+			Updates(&User{
+				BaseModel: database.BaseModel{
+					UpdatedAt: new(time.Now()),
+				},
+				Username:    localUser.Username,
+				DisplayName: localUser.DisplayName,
+				Email:       localUser.Email,
+				Locale:      localUser.Locale,
+				TimeFormat:  localUser.TimeFormat,
+				FontSize:    localUser.FontSize,
+				Preferences: localUser.Preferences,
+			}).Error; err != nil {
 			if isDuplicateKeyErrorInternal(tx, err) {
 				return ErrUsernameTaken
 			}
 			return fmt.Errorf("failed to update user: %w", err)
+		}
+		if reloadErr := tx.Where("id = ?", localUser.ID).First(&updated).Error; reloadErr != nil {
+			return fmt.Errorf("failed to reload user: %w", reloadErr)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	*localUser = updated
 	return localUser, nil
+}
+
+func ensureEmailAvailable(tx *gorm.DB, userID string, email *string) error {
+	if kit.FromPtr(email) == "" {
+		return nil
+	}
+	var ids []string
+	if err := tx.Model(&User{}).
+		Where("LOWER(email) = LOWER(?) AND id <> ?", *email, userID).
+		Limit(1).
+		Pluck("id", &ids).Error; err != nil {
+		return fmt.Errorf("failed to check email availability: %w", err)
+	}
+	return kit.Ternary[error](len(ids) > 0, ErrEmailTaken, nil)
 }
 
 // TouchLastLogin updates only the user's last login time.
@@ -331,21 +393,45 @@ func (s *UserService) SetPassword(ctx context.Context, localUser *User, password
 		return nil, errors.New("user is nil")
 	}
 
-	hashedPassword, err := s.HashPassword(password)
+	hashedPassword, err := s.HashPassword(ctx, password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to hash password: %w", err)
 	}
 
-	localUser.PasswordHash = hashedPassword
-	localUser.RequiresPasswordChange = false
-	return s.UpdateUser(ctx, localUser, nil)
+	var updated User
+	err = dbutil.WithTx(ctx, s.db.DB, func(tx *gorm.DB) error {
+		result := tx.Model(&User{}).
+			Where("id = ?", localUser.ID).
+			Select("password_hash", "requires_password_change", "updated_at").
+			Updates(&User{
+				BaseModel: database.BaseModel{
+					UpdatedAt: new(time.Now()),
+				},
+				PasswordHash: hashedPassword,
+			})
+		if result.Error != nil {
+			return fmt.Errorf("failed to update user password: %w", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return common.ErrUserNotFound
+		}
+		if reloadErr := tx.Where("id = ?", localUser.ID).First(&updated).Error; reloadErr != nil {
+			return fmt.Errorf("failed to reload user: %w", reloadErr)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	*localUser = updated
+	return localUser, nil
 }
 
 // SetPasswordAndRevokeSessionsExcept atomically sets a new password, clears
 // the first-login password-change requirement, and revokes every session for
 // the user except exceptSessionID. Pass an empty exceptSessionID to revoke all
 // sessions. This is for trusted internal callers.
-func (s *UserService) SetPasswordAndRevokeSessionsExcept(ctx context.Context, localUser *User, password, exceptSessionID string) (*User, error) {
+func (s *UserService) SetPasswordAndRevokeSessionsExcept(ctx context.Context, localUser *User, password, exceptSessionID string, actorPerms *authz.PermissionSet) (*User, error) {
 	if localUser == nil {
 		return nil, errors.New("user is nil")
 	}
@@ -353,13 +439,16 @@ func (s *UserService) SetPasswordAndRevokeSessionsExcept(ctx context.Context, lo
 		return nil, common.ErrUserNotFound
 	}
 
-	hashedPassword, err := s.HashPassword(password)
+	hashedPassword, err := s.HashPassword(ctx, password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to hash password: %w", err)
 	}
 
 	var updatedUser User
 	err = dbutil.WithTx(ctx, s.db.DB, func(tx *gorm.DB) error {
+		if privilegeErr := s.checkTargetPrivilegeInternal(ctx, tx, actorPerms, localUser.ID); privilegeErr != nil {
+			return privilegeErr
+		}
 		if loadPasswordResetUserErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ?", localUser.ID).
 			First(&updatedUser).Error; loadPasswordResetUserErr != nil {
@@ -406,7 +495,7 @@ func (s *UserService) AttachOidcSubjectTransactional(ctx context.Context, userID
 
 		// If already linked to a different subject, abort
 		if u.OidcSubjectId != nil && *u.OidcSubjectId != "" && *u.OidcSubjectId != subject {
-			return errors.New("user already linked to another OIDC subject")
+			return common.Classify(common.ErrConflict, errors.New("user already linked to another OIDC subject"))
 		}
 
 		// Link subject
@@ -422,7 +511,8 @@ func (s *UserService) AttachOidcSubjectTransactional(ctx context.Context, userID
 		if err := tx.Save(&u).Error; err != nil {
 			// Bubble up uniqueness violations with a clearer message
 			if strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "duplicate key") {
-				return fmt.Errorf("oidc subject is already linked to another user: %w", err)
+				slog.WarnContext(ctx, "OIDC subject link rejected by uniqueness constraint", "userId", userID, "error", err)
+				return common.Classify(common.ErrConflict, errors.New("oidc subject is already linked to another user"))
 			}
 			return fmt.Errorf("failed to persist OIDC merge: %w", err)
 		}
@@ -468,7 +558,7 @@ func (s *UserService) CreateDefaultAdmin(ctx context.Context) error {
 		}
 
 		if count == 0 {
-			hashedPassword, err := s.HashPassword("arcane-admin")
+			hashedPassword, err := s.HashPassword(ctx, "arcane-admin")
 			if err != nil {
 				return fmt.Errorf("failed to hash default admin password: %w", err)
 			}
@@ -553,33 +643,29 @@ func (s *UserService) grantDefaultAdminRoleInternal(ctx context.Context, adminUs
 // be present in ctx. Pass nil for internal service-to-service calls. A
 // non-admin caller may not delete a global admin target.
 func (s *UserService) DeleteUser(ctx context.Context, id string, actorPerms *authz.PermissionSet) error {
-	// Last-admin guard: if this user's effective permissions make them the only
-	// global admin, refuse the delete. Checked outside the transaction because
-	// role.RoleService uses its own session and the guard spans rows.
-	if s.roleService != nil {
-		ps, err := s.roleService.ResolvePermissions(ctx, id)
-		if err != nil {
+	err := dbutil.WithTx(ctx, s.db.DB, func(tx *gorm.DB) error {
+		if err := s.roleService.LockGlobalAdminGuard(tx); err != nil {
 			return err
 		}
-		if ps != nil && ps.IsGlobalAdmin() {
-			remaining, countGlobalAdminsExcludingUserErr := s.roleService.CountGlobalAdmins(ctx, s.db.DB, id)
-			if countGlobalAdminsExcludingUserErr != nil {
-				return countGlobalAdminsExcludingUserErr
-			}
-			if remaining == 0 {
-				return ErrCannotRemoveLastAdmin
-			}
-		}
-	}
-	return dbutil.WithTx(ctx, s.db.DB, func(tx *gorm.DB) error {
 		if err := s.checkTargetPrivilegeInternal(ctx, tx, actorPerms, id); err != nil {
 			return err
 		}
-		if err := tx.Delete(&User{}, "id = ?", id).Error; err != nil {
-			return fmt.Errorf("failed to delete user: %w", err)
+		targetPerms, err := s.roleService.ResolveUserPermissionsInDB(ctx, tx, id)
+		if err != nil {
+			return fmt.Errorf("failed to resolve target permissions: %w", err)
 		}
-		return nil
+		if deleteErr := tx.Delete(&User{}, "id = ?", id).Error; deleteErr != nil {
+			return fmt.Errorf("failed to delete user: %w", deleteErr)
+		}
+		if !targetPerms.IsGlobalAdmin() {
+			return nil
+		}
+		return s.roleService.AssertGlobalAdminExists(ctx, tx)
 	})
+	if errors.Is(err, common.ErrNoGlobalAdminRemains) {
+		return ErrCannotRemoveLastAdmin
+	}
+	return err
 }
 
 func (s *UserService) ListUsersPaginated(ctx context.Context, params pagination.QueryParams) ([]user.User, pagination.Response, error) {
